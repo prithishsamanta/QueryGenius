@@ -103,6 +103,7 @@ Add When MVP Works:
 4. **Database Best Practices**: Always use SQLAlchemy ORM, never raw SQL strings
 5. **AI Integration Safety**: Mock LLM calls until Bedrock credentials available
 6. **How To Write Comments**: None of the Comments should have useless Emojis in them
+7. **Development Branch**: All code changesand development should take place in the development branch. The main branch should not be touched
 </principles>
 
 ### Code Style
@@ -235,6 +236,10 @@ def analyze_query(
    - Implement function fully (no placeholders)
    - Test manually with curl or Python REPL
    - Verify database changes with psql
+   - Check whether changes are being made while working on the development branch or not. If not switch to development branch using
+   ```bash
+   git checkout development
+   ```
 
 3. **After feature works**:
    ```bash
