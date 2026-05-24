@@ -1,0 +1,281 @@
+{
+    "model": "claude-sonnet-4-20250514",
+    "autoApprove": false,
+    
+    "permissions": {
+      "allowedCommands": [
+        "python",
+        "python3",
+        "pip",
+        "psql",
+        "uvicorn",
+        "black",
+        "ruff",
+        "git",
+        "curl",
+        "docker",
+        "docker-compose"
+      ],
+      "blockedPaths": [
+        "__pycache__/",
+        "*.pyc",
+        ".env",
+        ".env.local",
+        ".env.production",
+        "secrets/",
+        ".venv/",
+        "venv/",
+        "*.key",
+        "*.pem",
+        ".aws/credentials"
+      ],
+      "requireConfirmation": [
+        "git commit",
+        "git push",
+        "pip install",
+        "rm -rf",
+        "dropdb",
+        "psql -c DROP",
+        "docker-compose down -v"
+      ]
+    },
+  
+    "agentBoundaries": {
+      "maxConsecutiveActions": 10,
+      "requireApprovalFor": [
+        "file_delete",
+        "database_drop",
+        "config_modification",
+        "package_installation",
+        "git_operations",
+        "schema_migration"
+      ],
+      "stopConditions": [
+        "security_vulnerability_detected",
+        "syntax_error",
+        "database_connection_failure",
+        "missing_environment_variable"
+      ]
+    },
+  
+    "codeQuality": {
+      "enforceTypeHints": true,
+      "enforceDocstrings": true,
+      "noPlaceholders": true,
+      "maxLineLength": 100,
+      "requireTests": false,
+      "pythonVersion": "3.9.6"
+    },
+  
+    "git": {
+      "autoCheckpoint": true,
+      "checkpointMessage": "checkpoint: before AI changes",
+      "requireReview": true,
+      "commitConventions": {
+        "feat": "New feature",
+        "fix": "Bug fix",
+        "refactor": "Code refactoring",
+        "docs": "Documentation",
+        "test": "Tests",
+        "chore": "Maintenance",
+        "checkpoint": "Development checkpoint"
+      }
+    },
+  
+    "database": {
+      "engine": "postgresql",
+      "requireMigrations": true,
+      "noRawSQL": true,
+      "alwaysUseORM": true,
+      "validateConnections": true,
+      "extensions": ["pgvector"],
+      "warnOnSchemaChanges": true
+    },
+  
+    "ai": {
+      "mockExternalAPIs": true,
+      "provider": "aws_bedrock",
+      "model": "claude-3-5-sonnet",
+      "requireThinkingTags": true,
+      "maxRetries": 3,
+      "timeoutSeconds": 30
+    },
+  
+    "development": {
+      "phase": "mvp",
+      "features": {
+        "asyncProcessing": false,
+        "comprehensiveTesting": false,
+        "productionDeployment": false
+      },
+      "focus": [
+        "core_functionality",
+        "database_integration",
+        "api_endpoints",
+        "vector_similarity"
+      ]
+    },
+  
+    "environment": {
+      "pythonPath": "python3",
+      "virtualEnv": ".venv",
+      "formatter": "black",
+      "linter": "ruff",
+      "requireEnvFile": true,
+      "envTemplate": ".env.example"
+    },
+  
+    "contextManagement": {
+      "maxTokens": 200000,
+      "prioritizeRecent": true,
+      "excludePatterns": [
+        "*.pyc",
+        "__pycache__",
+        ".pytest_cache",
+        "*.egg-info",
+        ".venv",
+        "node_modules",
+        ".ruff_cache"
+      ],
+      "includePatterns": [
+        "src/**/*.py",
+        "tests/**/*.py",
+        "scripts/**/*.py",
+        ".claude/**/*.md",
+        "requirements.txt",
+        ".env.example"
+      ]
+    },
+  
+    "safety": {
+      "blockSecretsInCode": true,
+      "warnOnSensitiveOps": true,
+      "requireConfirmationFor": [
+        "database_operations",
+        "api_key_usage",
+        "file_deletion",
+        "schema_modifications",
+        "credential_handling"
+      ],
+      "scanForSecrets": true,
+      "secretPatterns": [
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "password",
+        "api_key",
+        "secret",
+        "token"
+      ]
+    },
+  
+    "api": {
+      "framework": "fastapi",
+      "host": "0.0.0.0",
+      "port": 8000,
+      "reloadOnChange": true,
+      "corsEnabled": true,
+      "validateRequestBodies": true,
+      "requireAuthentication": false
+    },
+  
+    "vectorDatabase": {
+      "extension": "pgvector",
+      "embeddingModel": "sentence-transformers/all-MiniLM-L6-v2",
+      "embeddingDimension": 384,
+      "similarityMetric": "cosine",
+      "indexType": "ivfflat",
+      "validateDimensions": true
+    },
+  
+    "logging": {
+      "level": "INFO",
+      "format": "json",
+      "includeTimestamp": true,
+      "logToFile": false,
+      "logDatabase": false
+    },
+  
+    "performance": {
+      "connectionPoolSize": 10,
+      "maxOverflow": 20,
+      "poolRecycle": 3600,
+      "statementTimeout": 30000,
+      "queryWarningThreshold": 1000
+    },
+  
+    "errorHandling": {
+      "returnDetailedErrors": true,
+      "logStackTraces": true,
+      "includeRequestContext": true,
+      "retryTransientErrors": true,
+      "maxRetries": 3
+    },
+  
+    "projectMetadata": {
+      "name": "QueryGenius",
+      "version": "0.1.0-mvp",
+      "description": "AI-Powered Database Query Optimization Platform",
+      "author": "Prithish Samanta",
+      "repository": "github.com/prithishsamanta/querygenius",
+      "resumeMetrics": {
+        "targetQueryPatterns": 10000,
+        "targetImprovement": "40%",
+        "targetCompletionRate": "99.5%"
+      }
+    },
+  
+    "shortcuts": {
+      "startServer": "uvicorn src.api.main:app --reload --port 8000",
+      "setupDB": "python scripts/setup_db.py",
+      "seedData": "python scripts/seed_data.py",
+      "format": "black src/ tests/ scripts/ --line-length 100",
+      "lint": "ruff check src/ tests/ scripts/",
+      "checkDB": "psql -U querygenius -d querygenius -c 'SELECT COUNT(*) FROM queries;'",
+      "testAPI": "curl -X POST http://localhost:8000/api/analyze -H 'Content-Type: application/json' -d '{\"query_text\": \"SELECT * FROM users\", \"execution_time_ms\": 1200}'"
+    },
+  
+    "reminders": {
+      "beforeCoding": [
+        "Create git checkpoint: git add -A && git commit -m 'checkpoint: before [feature]'",
+        "Ensure .env file exists with required variables",
+        "Verify PostgreSQL is running: psql -U querygenius -d querygenius -c '\\dt'"
+      ],
+      "afterFeature": [
+        "Test manually with curl or REPL",
+        "Verify database changes with psql",
+        "Commit with conventional message: git add -A && git commit -m 'feat: [description]'"
+      ],
+      "beforePush": [
+        "Run formatter: black src/ --line-length 100",
+        "Run linter: ruff check src/",
+        "Check for secrets: grep -r 'aws_access_key' src/"
+      ]
+    },
+  
+    "phaseGates": {
+      "mvp": {
+        "requiredFeatures": [
+          "PostgreSQL with pgvector installed",
+          "SQLAlchemy models created",
+          "POST /api/analyze endpoint working",
+          "GET /api/analysis endpoint working",
+          "Embedding generation functional",
+          "pgvector similarity search operational",
+          "Mock LLM analyzer returning recommendations"
+        ],
+        "blockers": [
+          "Missing pgvector extension",
+          "Database connection failures",
+          "Embedding model not loading"
+        ]
+      },
+      "phase2": {
+        "dependencies": [
+          "MVP completed and tested",
+          "AWS Bedrock credentials available",
+          "Redis installed for Celery"
+        ]
+      }
+    }
+  }
+  
