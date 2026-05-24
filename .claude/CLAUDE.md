@@ -205,6 +205,7 @@ def analyze_query(
 - [x] Project structure planned
 - [x] Tech stack decided
 - [x] CLAUDE.md created
+- [x] ARCHITECTURE.md created with target architecture + Day 1 checkpoint
 
 - In Progress (Phase 1 MVP)
 - [ ] PostgreSQL + pgvector setup script
@@ -246,7 +247,14 @@ def analyze_query(
    git add -A && git commit -m "feat: [feature description]"
    ```
 
-4. **Daily shutdown**:
+4. **Before every checkpoint commit**: Update `ARCHITECTURE.md`
+   - Append a new dated entry to the Checkpoint Log (newest at top)
+   - Update the "real vs mocked" table to reflect current state
+   - Update the current data flow Mermaid diagram
+   - Update "What comes next" with the next milestone targets
+   - The Target Architecture section at the top should never be changed
+
+5. **Daily shutdown**:
    ```bash
    git add -A && git commit -m "checkpoint: end of day [date]"
    ```
