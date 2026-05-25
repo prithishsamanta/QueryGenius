@@ -257,6 +257,155 @@ Entries are newest-first. Each entry shows what is real, what is mocked, and the
 
 ---
 
+### Checkpoint: Day 2 — 2026-05-25
+
+**Commits:**
+- `feat: Add analysis_id storage, GET retrieval, and seed data script`
+- `feat: Add schema context to LLM prompts for precise recommendations`
+
+#### What is real vs mocked
+
+| Component | Status | Notes |
+|---|---|---|
+| FastAPI app + CORS | Real | Running, auto-docs at `/docs` |
+| `POST /api/analyze` route | Real | Fully wired end-to-end |
+| `GET /api/analysis/{id}` route | Real | Retrieves stored analysis by UUID |
+| Pydantic request/response models | Real | Now includes optional `schema_context` field |
+| `analysis_id` (UUID) storage | Real | Generated at request start, stored in `queries` table |
+| PostgreSQL connection | Real | SQLAlchemy engine + session DI |
+| `queries` table + `optimizations` table | Real | `analysis_id` column added (VARCHAR 36, unique, indexed) |
+| pgvector extension + IVFFlat index | Real | Rebuilt on 10,000 real rows — meaningful clusters |
+| Embedding generation | Real | `all-MiniLM-L6-v2`, 384-dim, lazy-loaded |
+| pgvector similarity search | Real | Cosine distance, threshold 0.7, top-3 — now returns real results |
+| Seed data | Real | 10,000 queries across 15 slow-query patterns, batch encoded and inserted |
+| Schema context in prompts | Real | `fetch_schema_from_db()` introspects `pg_catalog`; passed through request → LLM |
+| `build_analysis_prompt()` | Real | Structured prompt with schema + RAG context ready for Bedrock in Phase 2 |
+| LLM / AI recommendations | **Mocked** | Pattern-matching rules, but now schema-aware (exact column names, index dedup) |
+| Celery async task queue | **Not started** | All processing is synchronous |
+| Redis | **Not started** | No broker configured |
+| AWS Bedrock integration | **Not started** | No credentials wired — mock in place |
+
+#### What changed since Day 1
+
+**`analysis_id` lifecycle fixed**
+Previously a UUID was generated at response time and thrown away — impossible to
+retrieve later. Now generated at the start of the POST call, stored in the `queries`
+table, and the same value returned in the response. `GET /api/analysis/{id}` looks
+it up and reconstructs the response from stored `optimizations` rows.
+
+**Seed data**
+10,000 sample slow queries inserted covering 15 anti-patterns (full table scans,
+LIKE wildcards, multi-JOINs, NOT IN subqueries, function-on-indexed-column, etc.).
+Embeddings batch-encoded (256 per batch) and bulk-inserted (500 per transaction).
+IVFFlat index rebuilt after insert so cluster centroids reflect real data.
+
+**Schema context**
+`AnalyzeRequest` now accepts an optional `schema_context` list. `src/utils/parsers.py`
+provides `fetch_schema_from_db()` to pull table/column/index info from any PostgreSQL
+database via `information_schema` and `pg_catalog`. The mock LLM uses this to:
+- Name exact columns in index SQL (`ON bookings USING gin(status gin_trgm_ops)`)
+- List actual column names in SELECT * rewrites
+- Skip indexes that already exist in the schema
+
+#### Current Data Flow
+
+```mermaid
+flowchart TD
+    Client([HTTP Client]) -->|POST /api/analyze\nquery_text + execution_time_ms\n+ optional schema_context| Route
+
+    subgraph API Layer
+        Route[analysis.py\nPOST /api/analyze]
+        Pydantic[AnalyzeRequest Validation\n+ schema_context field]
+        Route --> Pydantic
+    end
+
+    subgraph AnalyzerService
+        UUID[Generate UUID\nanalysis_id]
+        Embed[generate_embedding\nall-MiniLM-L6-v2\n384 floats]
+        Store[Store Query + analysis_id\nqueries table]
+        Search[find_similar_queries\npgvector cosine distance\ntop-3 from 10000 rows]
+        Mock[mock_analyze_with_claude\nschema-aware pattern matching]
+        StoreRec[Store Recommendations\noptimizations table]
+
+        Pydantic --> UUID
+        UUID --> Embed
+        Embed --> Store
+        Store --> Search
+        Search -->|top-3 similar queries| Mock
+        Mock --> StoreRec
+    end
+
+    subgraph PostgreSQL
+        QueriesTable[(queries\n+ analysis_id\n+ embedding VECTOR 384\n10005 rows)]
+        OptTable[(optimizations)]
+        VecIndex[(IVFFlat Index\nbuilt on real data)]
+        Store --> QueriesTable
+        QueriesTable --- VecIndex
+        VecIndex --> Search
+        StoreRec --> OptTable
+    end
+
+    StoreRec -->|AnalyzeResponse JSON\nanalysis_id + recommendations + similar_queries| Client
+
+    Client2([HTTP Client]) -->|GET /api/analysis/uuid| GetRoute[analysis.py\nGET /api/analysis/id]
+    GetRoute -->|lookup by analysis_id| QueriesTable
+    GetRoute -->|fetch recommendations| OptTable
+    GetRoute -->|AnalyzeResponse JSON| Client2
+
+    style Mock fill:#f5a623,color:#000
+    style Search fill:#7ed321,color:#000
+    style Embed fill:#7ed321,color:#000
+    style UUID fill:#7ed321,color:#000
+    style GetRoute fill:#7ed321,color:#000
+```
+
+**Orange** = mocked component. **Green** = real and working.
+
+#### How to run at this checkpoint
+
+```bash
+# First time only — seed the database
+python3 scripts/seed_data.py
+
+# Start the API
+python3 -m uvicorn src.api.main:app --reload --port 8000
+
+# Submit a query without schema context
+curl -X POST http://localhost:8000/api/analyze \
+  -H "Content-Type: application/json" \
+  -d '{"query_text": "SELECT * FROM bookings WHERE status LIKE '\''%confirmed%'\''", "execution_time_ms": 2300}'
+
+# Submit a query with schema context (precise recommendations)
+curl -X POST http://localhost:8000/api/analyze \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query_text": "SELECT * FROM bookings WHERE status LIKE '\''%confirmed%'\''",
+    "execution_time_ms": 2300,
+    "schema_context": [
+      {
+        "table": "bookings",
+        "columns": [
+          {"name": "id", "type": "integer", "nullable": false},
+          {"name": "status", "type": "character varying", "nullable": false}
+        ],
+        "indexes": [{"name": "bookings_pkey", "columns": ["id"], "unique": true}]
+      }
+    ]
+  }'
+
+# Retrieve a previous analysis by its UUID
+curl http://localhost:8000/api/analysis/<analysis_id>
+```
+
+#### What comes next (Day 3 targets)
+
+- Replace mock LLM with real AWS Bedrock call (Phase 2)
+- Add Celery + Redis for async processing (Phase 2)
+- Write pytest suite covering happy path, edge cases, error cases (Phase 2)
+- README with full demo instructions and architecture summary
+
+---
+
 ### Checkpoint: Day 1 MVP — 2026-05-24
 
 **Commit:** `feat: Complete Day 1 MVP - Core QueryGenius functionality`
