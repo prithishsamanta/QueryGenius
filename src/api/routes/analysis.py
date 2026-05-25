@@ -4,8 +4,9 @@ from sqlalchemy.orm import Session
 from typing import List
 
 from src.core.database import get_db
-from src.api.models import AnalyzeRequest, AnalyzeResponse
+from src.api.models import AnalyzeRequest, AnalyzeResponse, Recommendation, SimilarQuery
 from src.services.analyzer import AnalyzerService
+from src.models.schemas import Query, Optimization
 
 router = APIRouter(prefix="/api", tags=["analysis"])
 
@@ -78,12 +79,36 @@ async def get_analysis(
         HTTPException: 404 if analysis not found, 500 if processing fails
     """
     try:
-        # For MVP, we'll return a placeholder response
-        # In Phase 2, implement proper analysis retrieval from database
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Analysis retrieval not implemented in MVP"
+        query = db.query(Query).filter(Query.analysis_id == analysis_id).first()
+
+        if query is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Analysis {analysis_id} not found"
+            )
+
+        optimizations = db.query(Optimization).filter(
+            Optimization.query_id == query.id
+        ).all()
+
+        recommendations = [
+            Recommendation(
+                type=opt.recommendation_type,
+                description=opt.recommendation_text,
+                sql=None,
+                predicted_improvement=f"{opt.predicted_improvement_percent}%"
+            )
+            for opt in optimizations
+        ]
+
+        return AnalyzeResponse(
+            analysis_id=query.analysis_id,
+            status="completed",
+            recommendations=recommendations,
+            similar_queries=[],
+            created_at=query.created_at
         )
+
     except HTTPException:
         raise
     except Exception as e:

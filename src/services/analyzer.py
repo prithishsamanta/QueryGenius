@@ -32,11 +32,15 @@ class AnalyzerService:
         Returns:
             Analysis result with recommendations
         """
+        # Generate UUID first so it can be stored and returned consistently
+        analysis_id = str(uuid.uuid4())
+
         # 1. Generate embedding
         embedding = generate_embedding(query_text)
 
-        # 2. Store query in database
+        # 2. Store query in database with the analysis_id
         query = Query(
+            analysis_id=analysis_id,
             query_text=query_text,
             execution_time_ms=execution_time_ms,
             execution_plan=execution_plan,
@@ -69,7 +73,7 @@ class AnalyzerService:
         self.db.commit()
 
         return {
-            "analysis_id": str(uuid.uuid4()),
+            "analysis_id": analysis_id,
             "status": "completed",
             "recommendations": recommendations,
             "similar_queries": similar,
