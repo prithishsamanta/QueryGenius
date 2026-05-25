@@ -23,6 +23,7 @@ class Query(Base):
     __tablename__ = "queries"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    analysis_id = Column(String(36), nullable=False, unique=True, index=True)
     query_text = Column(Text, nullable=False, index=True)
     execution_time_ms = Column(Float, nullable=True)
     execution_plan = Column(JSON, nullable=True)
