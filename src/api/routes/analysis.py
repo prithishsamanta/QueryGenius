@@ -39,7 +39,8 @@ async def analyze_query(
         result = await service.analyze(
             query_text=request.query_text,
             execution_time_ms=request.execution_time_ms,
-            execution_plan=request.execution_plan
+            execution_plan=request.execution_plan,
+            schema_context=request.schema_context
         )
         return result
     except ValueError as e:

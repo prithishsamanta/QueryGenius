@@ -19,7 +19,8 @@ class AnalyzerService:
         self,
         query_text: str,
         execution_time_ms: float,
-        execution_plan: Dict = None
+        execution_plan: Dict = None,
+        schema_context: List[Dict] = None,
     ) -> Dict:
         """
         Analyze a query and return recommendations.
@@ -28,6 +29,7 @@ class AnalyzerService:
             query_text: SQL query to analyze
             execution_time_ms: Execution time in milliseconds
             execution_plan: Optional EXPLAIN output
+            schema_context: Optional table schema dicts for precise recommendations
 
         Returns:
             Analysis result with recommendations
@@ -58,7 +60,8 @@ class AnalyzerService:
         recommendations = await mock_analyze_with_claude(
             query_text=query_text,
             execution_plan=execution_plan,
-            similar_queries=similar
+            similar_queries=similar,
+            schema_context=schema_context,
         )
 
         # 5. Store recommendations
