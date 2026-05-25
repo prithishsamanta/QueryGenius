@@ -253,6 +253,7 @@ def analyze_query(
    - Update the current data flow Mermaid diagram
    - Update "What comes next" with the next milestone targets
    - The Target Architecture section at the top should never be changed
+   - The Deployment Architecture & Security Model section should only be updated if network design decisions change (not every checkpoint)
 
 5. **Daily shutdown**:
    ```bash
