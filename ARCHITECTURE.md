@@ -75,8 +75,8 @@ POST /api/analyze
     → generate embedding (sentence-transformers)
     → store query + embedding in queries table
     → pgvector search: find top-3 similar historical queries
-    → build RAG prompt (query + execution plan + similar history)
-    → call Claude 3.5 Sonnet via AWS Bedrock
+    → build RAG prompt (query + schema context + similar history)
+    → call Claude 3.5 Sonnet via AWS Bedrock (over PrivateLink)
     → parse recommendations
     → store recommendations in optimizations table
   → return AnalyzeResponse (analysis_id, recommendations, similar_queries)
@@ -85,6 +85,169 @@ GET /api/analysis/{id}
   → lookup analysis_id in database
   → return stored AnalyzeResponse
 ```
+
+---
+
+## Deployment Architecture & Security Model
+
+This section documents how QueryGenius is intended to be deployed in a production
+environment, and the reasoning behind the network design decisions.
+
+### Why QueryGenius is a sidecar, not embedded
+
+QueryGenius never connects directly to the application database. It receives query
+text and execution time as input over HTTP, and returns recommendations as output.
+The application database is never touched. This means:
+
+- Zero changes required to the ticketing app (or any other source app)
+- Blast radius of a QueryGenius compromise does not reach application data
+- Any app that can make an HTTP call can use QueryGenius
+
+### Network Topology
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                       GitHub Actions                         │
+│  Runs test suite, collects slow queries, POSTs to           │
+│  QueryGenius via VPN tunnel or self-hosted runner            │
+└──────────────────────────┬──────────────────────────────────┘
+                           │ HTTPS over VPN / private tunnel
+                           │ (query text + schema context)
+           ┌───────────────▼─────────────────────────────────┐
+           │                  VPC (company)                   │
+           │                                                  │
+           │  ┌───────────────────────────────────────────┐   │
+           │  │  Private Subnet A — Application           │   │
+           │  │  - App servers (e.g. movie ticketing)     │   │
+           │  │  - Application PostgreSQL DB              │   │
+           │  │  No public IP. Not reachable from         │   │
+           │  │  internet directly.                       │   │
+           │  └────────────────────┬──────────────────────┘   │
+           │                       │ VPC-internal traffic only │
+           │                       │ (slow query logs +        │
+           │                       │  schema context)          │
+           │  ┌────────────────────▼──────────────────────┐   │
+           │  │  Private Subnet B — QueryGenius           │   │
+           │  │  - FastAPI server                         │   │
+           │  │  - QueryGenius PostgreSQL + pgvector      │   │
+           │  │  - Embedding model (sentence-transformers)│   │
+           │  │  No public IP. Accepts inbound only from  │   │
+           │  │  Subnet A and VPN tunnel.                 │   │
+           │  └────────────────────┬──────────────────────┘   │
+           │                       │ Outbound via PrivateLink  │
+           └───────────────────────┼─────────────────────────-┘
+                                   │
+           ┌───────────────────────▼─────────────────────────┐
+           │         AWS PrivateLink (VPC Interface Endpoint) │
+           │  Traffic stays on AWS internal backbone.         │
+           │  Never traverses the public internet.            │
+           └───────────────────────┬─────────────────────────┘
+                                   │
+           ┌───────────────────────▼─────────────────────────┐
+           │              AWS Bedrock (Claude 3.5 Sonnet)     │
+           │  - Receives: query + schema context + RAG        │
+           │  - Returns: recommendations                      │
+           │  - Does not train on customer prompts            │
+           │  - Covered by AWS SOC 2, ISO 27001, HIPAA        │
+           └─────────────────────────────────────────────────┘
+```
+
+### What each subnet contains and why they are separate
+
+| Subnet | Contents | Inbound allowed from | Outbound allowed to |
+|---|---|---|---|
+| Subnet A (Application) | App servers, application DB | Internal app traffic only | Subnet B only |
+| Subnet B (QueryGenius) | FastAPI, pgvector DB, embedding model | Subnet A, VPN/GitHub runner | AWS Bedrock via PrivateLink only |
+
+Subnets are separated by **least privilege**: if Subnet B is compromised, the attacker
+still cannot reach the application database in Subnet A. The blast radius is contained.
+
+### AWS PrivateLink — why Bedrock is not "on the public internet"
+
+AWS Bedrock is a managed service and does not run inside your VPC. However, AWS
+PrivateLink creates a **VPC Interface Endpoint** that makes Bedrock reachable over
+AWS's internal backbone network — traffic never leaves AWS infrastructure and never
+touches the public internet.
+
+```
+Without PrivateLink:   Subnet B → Internet Gateway → Public Internet → Bedrock
+With PrivateLink:      Subnet B → VPC Endpoint → AWS Internal Network → Bedrock
+```
+
+This closes the last external exposure gap in the network design.
+
+### GitHub Actions integration
+
+GitHub Actions runners live outside your VPC. Two approaches for connecting them:
+
+**Option 1 — VPN Gateway (simpler to set up)**
+The VPC exposes a VPN endpoint. The CI job connects via OpenVPN or WireGuard at
+workflow start, making the runner behave as if it is inside the VPC for the duration
+of the job.
+
+**Option 2 — Self-hosted Runner in Subnet B (more secure)**
+The GitHub Actions runner itself runs as a process inside Subnet B. No tunnel needed.
+The runner is already on the private network. Preferred for sensitive environments.
+
+### End-to-end CI/CD data flow
+
+```
+1. GitHub Actions: run test suite against test DB in Subnet A
+      → pg_stat_statements collects slow queries during test run
+
+2. GitHub Actions: second job (via VPN or self-hosted runner)
+      → reads slow query logs from pg_stat_statements
+      → pulls schema via pg_catalog (read-only introspection)
+      → POSTs to QueryGenius in Subnet B:
+         { query_text, execution_time_ms, schema_context }
+
+3. QueryGenius (Subnet B):
+      → generates embedding for the query
+      → searches pgvector for similar historical queries
+      → builds RAG prompt: query + schema + similar history
+      → sends to AWS Bedrock via PrivateLink (never public internet)
+
+4. AWS Bedrock returns recommendations to Subnet B
+
+5. QueryGenius stores recommendations and returns AnalyzeResponse
+
+6. GitHub Actions posts recommendations as a PR comment
+      → developer sees query regressions before they hit production
+```
+
+### Schema context in prompts
+
+Passing schema context to Claude significantly improves recommendation quality.
+Without it, Claude can only guess column names and types. With it:
+
+```
+<schema>
+  Table: bookings (id SERIAL, seat_id INT FK, status VARCHAR(20), created_at TIMESTAMP)
+  Table: seats (id SERIAL, movie_id INT FK, row CHAR(1), number INT)
+  Existing indexes: bookings_pkey, seats_pkey, idx_seats_movie_id
+</schema>
+<query>
+  SELECT * FROM bookings JOIN seats ON bookings.seat_id = seats.id
+  WHERE seats.movie_id = 42 AND bookings.status = 'confirmed'
+</query>
+```
+
+Claude can then recommend the exact index, with correct column names, aware of what
+indexes already exist. Schema is pulled via `pg_catalog` (read-only) at analysis time
+and included in the prompt. It travels Subnet A → Subnet B on internal network, then
+Subnet B → Bedrock over PrivateLink. It is never exposed to the public internet.
+
+### Security properties of this design
+
+| Threat | Mitigation |
+|---|---|
+| External attacker reaching QueryGenius | No public IP on Subnet B — unreachable from internet |
+| DOS attack on QueryGenius | No public surface to attack |
+| MitM on Bedrock traffic | PrivateLink — traffic never on public internet |
+| Schema leak via prompt interception | PrivateLink + TLS — no public internet hop |
+| AWS training on customer prompts | AWS Bedrock policy: prompts not used for training |
+| Internal misconfiguration / credential leak | Biggest real risk — mitigated by secrets management, IAM roles, no hardcoded keys |
+| Subnet B compromise reaching Subnet A DB | Subnet separation — Subnet B has no route to Subnet A DB |
 
 ---
 
