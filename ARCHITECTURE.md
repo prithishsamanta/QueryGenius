@@ -257,6 +257,158 @@ Entries are newest-first. Each entry shows what is real, what is mocked, and the
 
 ---
 
+### Checkpoint: Day 3 — 2026-05-26
+
+**Commits:**
+- `fix: Add analysis_id generation to seed_data.py`
+- `docs: Add README with full setup guide, demo commands, and portfolio notes`
+- `refactor: Remove unused btree index on queries.query_text`
+- `feat: Add Celery + Redis async task queue for analysis pipeline`
+
+#### What is real vs mocked
+
+| Component | Status | Notes |
+|---|---|---|
+| FastAPI app + CORS | Real | Running, auto-docs at `/docs` |
+| `POST /api/analyze` route | Real | Returns in ~250ms with `status=processing` |
+| `GET /api/analysis/{id}` route | Real | Returns `processing`, `completed`, or `failed` |
+| Pydantic request/response models | Real | Includes optional `schema_context` field |
+| `analysis_id` UUID storage | Real | Generated at submit time, stored immediately |
+| `status` column on queries | Real | Tracks `processing` → `completed` / `failed` |
+| PostgreSQL connection | Real | SQLAlchemy engine + session DI |
+| `queries` + `optimizations` tables | Real | `status` column added, `embedding` nullable |
+| pgvector + IVFFlat index | Real | Built on 10,000 real rows |
+| Embedding generation | Real | `all-MiniLM-L6-v2`, 384-dim, runs inside Celery task |
+| pgvector similarity search | Real | Cosine distance, threshold 0.7, top-3 |
+| Redis message broker | Real | Holds task queue between FastAPI and Celery |
+| Celery async worker | Real | `--pool=solo` on Mac; `prefork` on Linux/production |
+| Exponential backoff on failure | Real | 3 retries: 2s, 4s, 8s delays |
+| Schema context in prompts | Real | `fetch_schema_from_db()` + prompt injection |
+| LLM / AI recommendations | **Mocked** | Pattern-matching rules, no Bedrock call yet |
+| AWS Bedrock integration | **Not started** | No credentials wired — one import swap needed |
+| pytest suite | **Not started** | Phase 2 |
+| GitHub Actions CI/CD | **Not started** | Phase 2 |
+| README | Real | Full setup guide, demo commands, interview talking points |
+
+#### What changed since Day 2
+
+**Celery + Redis async pipeline**
+The biggest change. POST `/api/analyze` no longer blocks — it inserts the
+query row immediately with `status=processing` and `embedding=null`, enqueues
+the task in Redis, and returns in ~250ms. The Celery worker picks up the task
+independently and runs the full pipeline: embedding generation → pgvector search
+→ LLM → store recommendations → mark `status=completed`. On failure, the task
+retries up to 3 times with exponential backoff (2s, 4s, 8s) before marking
+`status=failed`. Clients poll `GET /api/analysis/{id}` until status changes.
+
+**DB schema changes**
+- `status VARCHAR(20)` added to `queries` — default `processing`, updated to
+  `completed` or `failed` by the Celery task
+- `embedding` made nullable — the row is inserted before embedding is generated
+
+**Seed script + index cleanup**
+- `seed_data.py` fixed to include `analysis_id` per row (was causing NOT NULL violation)
+- Unused btree index on `query_text` removed — only used access patterns are
+  vector search (IVFFlat) and ID/analysis_id lookup (btree)
+
+**README**
+Full project README added with setup guide, curl demo examples, RAG pipeline
+explanation, Bedrock migration path, and interview talking points.
+
+#### Current Data Flow
+
+```mermaid
+flowchart TD
+    Client([HTTP Client]) -->|POST /api/analyze\nreturns in ~250ms| Route
+
+    subgraph API Layer
+        Route[POST /api/analyze]
+        Pydantic[AnalyzeRequest Validation]
+        Route --> Pydantic
+    end
+
+    subgraph AnalyzerService - runs synchronously
+        UUID[Generate UUID\nanalysis_id]
+        InsertRow[Insert Query row\nstatus=processing\nembedding=null]
+        Enqueue[Enqueue task\nrun_analysis.delay]
+        Pydantic --> UUID
+        UUID --> InsertRow
+        InsertRow --> Enqueue
+    end
+
+    Enqueue -->|task message| Redis[(Redis\nMessage Broker)]
+
+    subgraph Celery Worker - runs asynchronously
+        Embed[Generate Embedding\nall-MiniLM-L6-v2]
+        UpdateEmbed[Update embedding column]
+        Search[pgvector similarity search\ntop-3 from 10000 rows]
+        LLM[mock_analyze_with_claude\nschema-aware pattern matching]
+        StoreRec[Store Recommendations\noptimizations table]
+        MarkDone[Update status=completed\nor status=failed]
+
+        Redis --> Embed
+        Embed --> UpdateEmbed
+        UpdateEmbed --> Search
+        Search --> LLM
+        LLM --> StoreRec
+        StoreRec --> MarkDone
+    end
+
+    subgraph PostgreSQL
+        QueriesTable[(queries\nstatus + analysis_id\n+ embedding VECTOR 384)]
+        OptTable[(optimizations)]
+        VecIndex[(IVFFlat Index)]
+        InsertRow --> QueriesTable
+        UpdateEmbed --> QueriesTable
+        QueriesTable --- VecIndex
+        VecIndex --> Search
+        StoreRec --> OptTable
+        MarkDone --> QueriesTable
+    end
+
+    Client2([HTTP Client]) -->|GET /api/analysis/id\npoll until completed| GetRoute[GET /api/analysis/id]
+    GetRoute -->|lookup status| QueriesTable
+    GetRoute -->|fetch if completed| OptTable
+    GetRoute -->|AnalyzeResponse JSON| Client2
+
+    style LLM fill:#f5a623,color:#000
+    style Embed fill:#7ed321,color:#000
+    style Search fill:#7ed321,color:#000
+    style Redis fill:#7ed321,color:#000
+    style Enqueue fill:#7ed321,color:#000
+```
+
+**Orange** = mocked. **Green** = real and working.
+
+#### How to run at this checkpoint
+
+```bash
+# Terminal 1 — Redis
+redis-server
+
+# Terminal 2 — Celery worker (use --pool=solo on Mac with system Python 3.9)
+python3 -m celery -A src.core.celery_app:celery_app worker --loglevel=info --pool=solo
+
+# Terminal 3 — FastAPI
+python3 -m uvicorn src.api.main:app --reload --port 8000
+
+# Submit a query — returns instantly
+curl -X POST http://localhost:8000/api/analyze \
+  -H "Content-Type: application/json" \
+  -d '{"query_text": "SELECT * FROM bookings WHERE status LIKE '\''%confirmed%'\''", "execution_time_ms": 2300}'
+
+# Poll for results (replace with your analysis_id)
+curl http://localhost:8000/api/analysis/<analysis_id>
+```
+
+#### What comes next (Phase 2 remaining)
+
+- Replace mock LLM with real AWS Bedrock (one import swap once credentials available)
+- Write pytest suite — happy path, edge cases, error cases for all services
+- GitHub Actions CI/CD workflow — run tests, collect slow queries, post PR comments
+
+---
+
 ### Checkpoint: Day 2 — 2026-05-25
 
 **Commits:**

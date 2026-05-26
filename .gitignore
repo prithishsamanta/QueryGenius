@@ -24,6 +24,9 @@ env/
 *.db
 *.sqlite
 
+# Redis
+dump.rdb
+
 # Logs
 *.log
 
