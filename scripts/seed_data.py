@@ -14,6 +14,7 @@ import sys
 import os
 import random
 import time
+import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Dict
@@ -403,6 +404,7 @@ def seed(total: int = TOTAL_QUERIES) -> None:
             for i in range(batch_start, batch_end):
                 entry = pool[i]
                 batch.append(Query(
+                    analysis_id=str(uuid.uuid4()),
                     query_text=entry["query_text"],
                     execution_time_ms=entry["execution_time_ms"],
                     execution_plan=None,
