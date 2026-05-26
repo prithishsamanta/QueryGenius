@@ -24,12 +24,13 @@ class Query(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     analysis_id = Column(String(36), nullable=False, unique=True, index=True)
+    status = Column(String(20), nullable=False, default="processing")
     query_text = Column(Text, nullable=False)
     execution_time_ms = Column(Float, nullable=True)
     execution_plan = Column(JSON, nullable=True)
     database_name = Column(String(100), nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    embedding = Column(Vector(384), nullable=False)
+    embedding = Column(Vector(384), nullable=True)
 
     # Relationships
     optimizations = relationship("Optimization", back_populates="query", cascade="all, delete-orphan")
