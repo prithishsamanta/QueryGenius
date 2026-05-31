@@ -7,7 +7,7 @@ from src.core.database import SessionLocal
 from src.core.embeddings import generate_embedding
 from src.models.schemas import Query, Optimization
 from src.services.similarity import find_similar_queries
-from src.services.llm import mock_analyze_with_claude
+from src.services.llm import analyze_with_claude
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,7 @@ def run_analysis(
         # since Celery workers run synchronously
         import asyncio
         recommendations = asyncio.run(
-            mock_analyze_with_claude(
+            analyze_with_claude(
                 query_text=query_text,
                 execution_plan=execution_plan,
                 similar_queries=similar,

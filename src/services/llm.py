@@ -1,7 +1,333 @@
 # src/services/llm.py
+import asyncio
+import json
+import logging
+import os
+import re
+import time
+from functools import partial
 from typing import Dict, List, Optional
 
+import boto3
+from botocore.exceptions import ClientError
+
 from src.utils.parsers import format_schema_for_prompt
+
+logger = logging.getLogger(__name__)
+
+# Cached Bedrock client — initialized on first call
+_bedrock_client = None
+
+
+class CircuitBreaker:
+    """
+    Circuit breaker for AWS Bedrock API calls.
+
+    Prevents repeated calls to a failing service by tracking consecutive
+    failures and temporarily blocking requests once a threshold is reached.
+
+    States:
+        CLOSED — requests flow normally
+        OPEN — requests are blocked (service assumed down)
+        HALF_OPEN — one test request allowed to check recovery
+
+    Args:
+        failure_threshold: Number of consecutive failures before opening
+        reset_timeout: Seconds to wait before transitioning OPEN to HALF_OPEN
+    """
+
+    def __init__(self, failure_threshold: int = 5, reset_timeout: int = 60):
+        self.failure_threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+        self.failure_count: int = 0
+        self.last_failure_time: Optional[float] = None
+        self.state: str = "CLOSED"
+
+    def allow_request(self) -> bool:
+        """
+        Check whether the circuit allows a request through.
+
+        Returns:
+            True if the request should proceed, False if blocked
+        """
+        if self.state == "CLOSED":
+            return True
+
+        if self.state == "OPEN":
+            if time.time() - self.last_failure_time >= self.reset_timeout:
+                self.state = "HALF_OPEN"
+                return True
+            return False
+
+        # HALF_OPEN — allow one test request
+        return True
+
+    def record_success(self) -> None:
+        """Reset failure tracking after a successful call."""
+        self.failure_count = 0
+        self.state = "CLOSED"
+
+    def record_failure(self) -> None:
+        """Record a failure and open the circuit if threshold is reached."""
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+
+        if self.failure_count >= self.failure_threshold:
+            self.state = "OPEN"
+            logger.warning(
+                "Circuit breaker OPEN after %d consecutive failures",
+                self.failure_count,
+            )
+
+
+# Module-level circuit breaker instance shared across all calls
+_circuit_breaker = CircuitBreaker()
+
+
+def get_bedrock_client():
+    """
+    Get or initialize the cached AWS Bedrock Runtime client.
+
+    Uses AWS_REGION from environment (defaults to us-east-1).
+    AWS credentials are read from environment variables or the default
+    credential chain (instance profile, config file, etc.).
+
+    Returns:
+        boto3 Bedrock Runtime client
+
+    Raises:
+        ValueError: If AWS_ACCESS_KEY_ID is not set in environment
+    """
+    global _bedrock_client
+    if _bedrock_client is not None:
+        return _bedrock_client
+
+    if not os.getenv("AWS_ACCESS_KEY_ID"):
+        raise ValueError(
+            "AWS_ACCESS_KEY_ID not set — cannot initialize Bedrock client"
+        )
+
+    region = os.getenv("AWS_REGION", "us-east-1")
+    _bedrock_client = boto3.client(
+        service_name="bedrock-runtime",
+        region_name=region,
+    )
+    logger.info("Bedrock client initialized (region=%s)", region)
+    return _bedrock_client
+
+
+def parse_recommendations(llm_response: str) -> List[Dict]:
+    """
+    Parse Claude's text response into structured recommendation dicts.
+
+    Handles variations in LLM output: raw JSON, markdown-fenced JSON,
+    and extra surrounding text. Validates that each recommendation has
+    the required fields.
+
+    Args:
+        llm_response: Raw text response from Claude via Bedrock
+
+    Returns:
+        List of recommendation dicts with keys: type, description,
+        sql (nullable), predicted_improvement (string with %)
+
+    Raises:
+        ValueError: If no valid JSON found or structure is invalid
+    """
+    # Strip markdown code fences if present
+    cleaned = re.sub(r"```json\s*", "", llm_response)
+    cleaned = re.sub(r"```\s*", "", cleaned)
+
+    # Find the outermost JSON object
+    json_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if not json_match:
+        raise ValueError("No JSON object found in LLM response")
+
+    try:
+        data = json.loads(json_match.group(0))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Failed to parse JSON from LLM response: {exc}")
+
+    recommendations = data.get("recommendations", [])
+    if not isinstance(recommendations, list):
+        raise ValueError("'recommendations' must be a list")
+
+    for rec in recommendations:
+        if "type" not in rec or "description" not in rec:
+            raise ValueError(
+                "Each recommendation must have 'type' and 'description'"
+            )
+
+        # Coerce predicted_improvement to string with % suffix
+        improvement = rec.get("predicted_improvement", "0%")
+        if isinstance(improvement, (int, float)):
+            rec["predicted_improvement"] = f"{improvement}%"
+        elif isinstance(improvement, str) and not improvement.endswith("%"):
+            rec["predicted_improvement"] = f"{improvement}%"
+
+        # Default sql to None if missing
+        if "sql" not in rec:
+            rec["sql"] = None
+
+    return recommendations
+
+
+async def real_analyze_with_claude(
+    query_text: str,
+    execution_plan: Optional[Dict] = None,
+    similar_queries: Optional[List[Dict]] = None,
+    schema_context: Optional[List[Dict]] = None,
+    max_retries: int = 3,
+) -> List[Dict]:
+    """
+    Analyze a query using Claude 3.5 Sonnet via AWS Bedrock.
+
+    Builds a structured prompt with schema and RAG context, calls the
+    Bedrock InvokeModel API, parses the JSON response, and returns
+    recommendations. Retries with exponential backoff on throttling.
+
+    If the circuit breaker is open (repeated Bedrock failures), falls
+    back to mock_analyze_with_claude automatically.
+
+    Args:
+        query_text: SQL query to analyze
+        execution_plan: Optional EXPLAIN ANALYZE output
+        similar_queries: Historical similar queries from RAG
+        schema_context: Table schema dicts from fetch_schema_from_db()
+        max_retries: Maximum retry attempts on transient failures
+
+    Returns:
+        List of recommendation dicts
+
+    Raises:
+        Exception: If all retries exhausted and circuit breaker not tripped
+    """
+    # Circuit breaker check — fall back to mock if Bedrock is down
+    if not _circuit_breaker.allow_request():
+        logger.warning(
+            "Circuit breaker OPEN — falling back to mock analyzer"
+        )
+        return await mock_analyze_with_claude(
+            query_text=query_text,
+            execution_plan=execution_plan,
+            similar_queries=similar_queries,
+            schema_context=schema_context,
+        )
+
+    client = get_bedrock_client()
+    model_id = os.getenv(
+        "AWS_BEDROCK_MODEL_ID",
+        "anthropic.claude-3-5-sonnet-20241022-v2:0",
+    )
+
+    prompt = build_analysis_prompt(
+        query_text=query_text,
+        execution_plan=execution_plan,
+        similar_queries=similar_queries,
+        schema_context=schema_context,
+    )
+
+    body = json.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 2000,
+        "temperature": 0.3,
+        "messages": [{"role": "user", "content": prompt}],
+    })
+
+    last_exception = None
+
+    for attempt in range(max_retries):
+        try:
+            # Run the synchronous boto3 call in a thread executor
+            # so we don't block the event loop
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                partial(client.invoke_model, modelId=model_id, body=body),
+            )
+
+            response_body = json.loads(response["body"].read())
+            llm_text = response_body["content"][0]["text"]
+
+            recommendations = parse_recommendations(llm_text)
+            _circuit_breaker.record_success()
+
+            logger.info(
+                "Bedrock returned %d recommendations", len(recommendations)
+            )
+            return recommendations
+
+        except ClientError as exc:
+            error_code = exc.response["Error"]["Code"]
+            last_exception = exc
+
+            if error_code == "ThrottlingException" and attempt < max_retries - 1:
+                wait = 2 ** attempt
+                logger.warning(
+                    "Bedrock throttled (attempt %d/%d), retrying in %ds",
+                    attempt + 1,
+                    max_retries,
+                    wait,
+                )
+                await asyncio.sleep(wait)
+            else:
+                _circuit_breaker.record_failure()
+                if attempt == max_retries - 1:
+                    break
+                await asyncio.sleep(1)
+
+        except Exception as exc:
+            last_exception = exc
+            _circuit_breaker.record_failure()
+            logger.error("Bedrock call failed: %s", exc)
+
+            if attempt == max_retries - 1:
+                break
+            await asyncio.sleep(1)
+
+    raise last_exception
+
+
+async def analyze_with_claude(
+    query_text: str,
+    execution_plan: Optional[Dict] = None,
+    similar_queries: Optional[List[Dict]] = None,
+    schema_context: Optional[List[Dict]] = None,
+) -> List[Dict]:
+    """
+    Dispatcher that routes to real or mock Claude analyzer.
+
+    Uses real AWS Bedrock when AWS_ACCESS_KEY_ID is set in the
+    environment. Falls back to the mock analyzer otherwise, allowing
+    development and testing without AWS credentials.
+
+    Args:
+        query_text: SQL query to analyze
+        execution_plan: Optional EXPLAIN ANALYZE output
+        similar_queries: Historical similar queries from RAG
+        schema_context: Table schema dicts from fetch_schema_from_db()
+
+    Returns:
+        List of recommendation dicts
+    """
+    use_real = bool(os.getenv("AWS_ACCESS_KEY_ID"))
+
+    if use_real:
+        logger.info("Using real Bedrock analyzer")
+        return await real_analyze_with_claude(
+            query_text=query_text,
+            execution_plan=execution_plan,
+            similar_queries=similar_queries,
+            schema_context=schema_context,
+        )
+
+    logger.info("AWS credentials not set — using mock analyzer")
+    return await mock_analyze_with_claude(
+        query_text=query_text,
+        execution_plan=execution_plan,
+        similar_queries=similar_queries,
+        schema_context=schema_context,
+    )
 
 
 def build_analysis_prompt(
