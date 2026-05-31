@@ -21,6 +21,15 @@ class AnalyzeRequest(BaseModel):
         None,
         description="EXPLAIN ANALYZE output as JSON"
     )
+    schema_context: Optional[List[dict]] = Field(
+        None,
+        description=(
+            "Schema info for tables referenced in the query. "
+            "Each entry should have: table (str), columns (list of {name, type, nullable}), "
+            "indexes (list of {name, columns, unique}). "
+            "Generate this via fetch_schema_from_db() in src/utils/parsers.py."
+        )
+    )
 
     @validator("query_text")
     def validate_query_text(cls, v):
