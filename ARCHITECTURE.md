@@ -257,6 +257,174 @@ Entries are newest-first. Each entry shows what is real, what is mocked, and the
 
 ---
 
+### Checkpoint: Day 4 — 2026-05-31
+
+**Commits:**
+- `feat: Add AWS Bedrock integration with circuit breaker and auto-fallback`
+
+#### What is real vs mocked
+
+| Component | Status | Notes |
+|---|---|---|
+| FastAPI app + CORS | Real | Running, auto-docs at `/docs` |
+| `POST /api/analyze` route | Real | Returns in ~250ms with `status=processing` |
+| `GET /api/analysis/{id}` route | Real | Returns `processing`, `completed`, or `failed` |
+| Pydantic request/response models | Real | Includes optional `schema_context` field |
+| `analysis_id` UUID storage | Real | Generated at submit time, stored immediately |
+| `status` column on queries | Real | Tracks `processing` -> `completed` / `failed` |
+| PostgreSQL connection | Real | SQLAlchemy engine + session DI |
+| `queries` + `optimizations` tables | Real | `status` column added, `embedding` nullable |
+| pgvector + IVFFlat index | Real | Built on 10,000 real rows |
+| Embedding generation | Real | `all-MiniLM-L6-v2`, 384-dim, runs inside Celery task |
+| pgvector similarity search | Real | Cosine distance, threshold 0.7, top-3 |
+| Redis message broker | Real | Holds task queue between FastAPI and Celery |
+| Celery async worker | Real | `--pool=solo` on Mac; `prefork` on Linux/production |
+| Exponential backoff on failure | Real | 3 retries: 2s, 4s, 8s delays |
+| Schema context in prompts | Real | `fetch_schema_from_db()` + prompt injection |
+| AWS Bedrock integration | **Real** | `real_analyze_with_claude()` with boto3, exponential backoff, circuit breaker |
+| LLM auto-fallback | Real | `analyze_with_claude()` dispatcher — uses Bedrock when credentials set, mock otherwise |
+| Circuit breaker | Real | Opens after 5 failures, resets after 60s, falls back to mock when open |
+| Response parsing | Real | `parse_recommendations()` handles JSON, markdown fences, validation |
+| pytest suite | **Started** | 14 tests for `parse_recommendations`, `CircuitBreaker`, dispatcher routing |
+| GitHub Actions CI/CD | **Not started** | Phase 2 |
+| README | Real | Full setup guide, demo commands, interview talking points |
+
+#### What changed since Day 3
+
+**AWS Bedrock integration**
+The mock LLM analyzer has been augmented with a real AWS Bedrock pathway.
+`real_analyze_with_claude()` calls Claude 3.5 Sonnet via the `bedrock-runtime`
+boto3 client with exponential backoff on throttling (1s, 2s, 4s). The sync
+boto3 call is wrapped in `asyncio.run_in_executor()` to stay async-compatible
+inside the Celery task.
+
+**Auto-fallback dispatcher**
+`analyze_with_claude()` checks `AWS_ACCESS_KEY_ID` at runtime. If set, it
+routes to the real Bedrock path; otherwise it falls back to the mock analyzer.
+This means the system works identically in development (no credentials) and
+production (credentials set) with zero code changes.
+
+**Circuit breaker**
+A `CircuitBreaker` class tracks consecutive Bedrock failures. After 5 failures,
+the breaker opens and all requests fall back to the mock analyzer for 60 seconds.
+After the timeout, one test request is allowed through (HALF_OPEN). A success
+resets the breaker to CLOSED.
+
+**Test suite started**
+14 pytest tests covering: JSON parsing (valid, markdown-wrapped, numeric coercion,
+missing fields, invalid input), circuit breaker state machine (CLOSED, OPEN,
+HALF_OPEN, reset), and dispatcher routing (mock vs real based on env vars).
+
+#### Current Data Flow
+
+```mermaid
+flowchart TD
+    Client([HTTP Client]) -->|POST /api/analyze\nreturns in ~250ms| Route
+
+    subgraph API Layer
+        Route[POST /api/analyze]
+        Pydantic[AnalyzeRequest Validation]
+        Route --> Pydantic
+    end
+
+    subgraph AnalyzerService - runs synchronously
+        UUID[Generate UUID\nanalysis_id]
+        InsertRow[Insert Query row\nstatus=processing\nembedding=null]
+        Enqueue[Enqueue task\nrun_analysis.delay]
+        Pydantic --> UUID
+        UUID --> InsertRow
+        InsertRow --> Enqueue
+    end
+
+    Enqueue -->|task message| Redis[(Redis\nMessage Broker)]
+
+    subgraph Celery Worker - runs asynchronously
+        Embed[Generate Embedding\nall-MiniLM-L6-v2]
+        UpdateEmbed[Update embedding column]
+        Search[pgvector similarity search\ntop-3 from 10000 rows]
+        Dispatch{analyze_with_claude\nchecks AWS_ACCESS_KEY_ID}
+        RealLLM[real_analyze_with_claude\nClaude 3.5 Sonnet via Bedrock]
+        MockLLM[mock_analyze_with_claude\npattern matching fallback]
+        CB{Circuit Breaker\ncheck}
+        StoreRec[Store Recommendations\noptimizations table]
+        MarkDone[Update status=completed\nor status=failed]
+
+        Redis --> Embed
+        Embed --> UpdateEmbed
+        UpdateEmbed --> Search
+        Search --> Dispatch
+        Dispatch -->|credentials set| CB
+        CB -->|CLOSED / HALF_OPEN| RealLLM
+        CB -->|OPEN| MockLLM
+        Dispatch -->|no credentials| MockLLM
+        RealLLM --> StoreRec
+        MockLLM --> StoreRec
+        StoreRec --> MarkDone
+    end
+
+    RealLLM -.->|boto3 invoke_model\nexp. backoff on throttle| Bedrock[AWS Bedrock\nClaude 3.5 Sonnet]
+
+    subgraph PostgreSQL
+        QueriesTable[(queries\nstatus + analysis_id\n+ embedding VECTOR 384)]
+        OptTable[(optimizations)]
+        VecIndex[(IVFFlat Index)]
+        InsertRow --> QueriesTable
+        UpdateEmbed --> QueriesTable
+        QueriesTable --- VecIndex
+        VecIndex --> Search
+        StoreRec --> OptTable
+        MarkDone --> QueriesTable
+    end
+
+    Client2([HTTP Client]) -->|GET /api/analysis/id\npoll until completed| GetRoute[GET /api/analysis/id]
+    GetRoute -->|lookup status| QueriesTable
+    GetRoute -->|fetch if completed| OptTable
+    GetRoute -->|AnalyzeResponse JSON| Client2
+
+    style RealLLM fill:#7ed321,color:#000
+    style MockLLM fill:#f5a623,color:#000
+    style CB fill:#7ed321,color:#000
+    style Embed fill:#7ed321,color:#000
+    style Search fill:#7ed321,color:#000
+    style Redis fill:#7ed321,color:#000
+    style Enqueue fill:#7ed321,color:#000
+    style Bedrock fill:#7ed321,color:#000
+```
+
+**Green** = real and working. **Orange** = mock fallback (used when no credentials or circuit open).
+
+#### How to run at this checkpoint
+
+```bash
+# Terminal 1 — Redis
+redis-server
+
+# Terminal 2 — Celery worker (use --pool=solo on Mac with system Python 3.9)
+python3 -m celery -A src.core.celery_app:celery_app worker --loglevel=info --pool=solo
+
+# Terminal 3 — FastAPI
+python3 -m uvicorn src.api.main:app --reload --port 8000
+
+# With mock (no AWS credentials)
+curl -X POST http://localhost:8000/api/analyze \
+  -H "Content-Type: application/json" \
+  -d '{"query_text": "SELECT * FROM bookings WHERE status LIKE '\''%confirmed%'\''", "execution_time_ms": 2300}'
+
+# With real Bedrock (set credentials in .env first)
+# export AWS_ACCESS_KEY_ID=AKIA... AWS_SECRET_ACCESS_KEY=... AWS_REGION=us-east-1
+
+# Run tests
+python3 -m pytest tests/test_llm.py -v
+```
+
+#### What comes next (Phase 2 remaining)
+
+- Write comprehensive pytest suite — happy path, edge cases, error cases for all services
+- GitHub Actions CI/CD workflow — run tests, lint, format checks
+- Performance metrics tracking
+
+---
+
 ### Checkpoint: Day 3 — 2026-05-26
 
 **Commits:**
